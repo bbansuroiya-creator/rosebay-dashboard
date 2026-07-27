@@ -3194,13 +3194,15 @@ async function cloudPullAll() {
 }
 
 // Fetch role/username from profiles → mirror to local session (keeps hasPerm() synchronous)
+let _authErr = '';
 async function loadSessionProfile(userId) {
   try {
-    const { data: prof, error } = await sb.from('profiles').select('username,name,role').eq('id', userId).single();
-    if (error || !prof) return false;
+    const { data: prof, error } = await sb.from('profiles').select('username,name,role,active').eq('id', userId).single();
+    if (error || !prof) { _authErr = 'ไม่พบโปรไฟล์ผู้ใช้'; return false; }
+    if (prof.active === false) { _authErr = 'บัญชีนี้ถูกปิดการใช้งาน'; try { await sb.auth.signOut(); } catch (e) {} return false; }
     setSession({ id: userId, username: prof.username, name: prof.name, role: prof.role });
     return true;
-  } catch { return false; }
+  } catch { _authErr = 'เกิดข้อผิดพลาด'; return false; }
 }
 
 async function doLogin() {
@@ -3216,7 +3218,7 @@ async function doLogin() {
     if (error) { console.error('signIn error:', error); errEl.textContent = 'เข้าระบบไม่ได้: ' + (error.message || 'ไม่ทราบสาเหตุ'); return; }
     if (!data || !data.user) { errEl.textContent = 'username หรือ password ไม่ถูกต้อง'; return; }
     const ok = await loadSessionProfile(data.user.id);
-    if (!ok) { errEl.textContent = 'เข้าระบบได้แต่ไม่พบโปรไฟล์ผู้ใช้'; return; }
+    if (!ok) { errEl.textContent = _authErr || 'เข้าระบบได้แต่ไม่พบโปรไฟล์ผู้ใช้'; return; }
     errEl.textContent = 'กำลังโหลดข้อมูล...';
     await cloudPullAll();
     errEl.textContent = '';
@@ -3257,6 +3259,7 @@ function applySession() {
 }
 
 async function initAuth() {
+  localStorage.removeItem('rosebay_users_v1');  // clear stale pre-Supabase local users
   // Restore an existing Supabase session (user stays logged in after refresh)
   if (sb) {
     try {
@@ -3280,85 +3283,105 @@ async function initAuth() {
 // ── User CRUD ──
 let _editingUserId = null;
 
-function openUserModal(userId) {
+async function openUserModal(userId) {
   _editingUserId = userId || null;
-  const users = loadUsers();
-  const u = userId ? users.find(x => x.id === userId) : null;
-  document.getElementById('user-modal-title').textContent = u ? 'แก้ไขผู้ใช้' : 'เพิ่มผู้ใช้ใหม่';
-  document.getElementById('u-name').value = u ? u.name : '';
-  document.getElementById('u-username').value = u ? u.username : '';
-  document.getElementById('u-password').value = '';
-  document.getElementById('u-pw-hint').textContent = u ? '(เว้นว่างเพื่อคงเดิม)' : '(ต้องกรอก)';
-  document.getElementById('u-role').value = u ? u.role : 'staff';
-  document.getElementById('u-error').textContent = '';
+  const nameEl = document.getElementById('u-name'), userEl = document.getElementById('u-username'),
+        pwEl = document.getElementById('u-password'), pwHint = document.getElementById('u-pw-hint'),
+        roleEl = document.getElementById('u-role'), errEl = document.getElementById('u-error');
+  errEl.textContent = '';
+  if (userId) {
+    document.getElementById('user-modal-title').textContent = 'แก้ไขผู้ใช้';
+    let u = null;
+    try { const { data } = await sb.from('profiles').select('username,name,role').eq('id', userId).single(); u = data; } catch (e) {}
+    nameEl.value = u ? (u.name || '') : ''; userEl.value = u ? (u.username || '') : ''; roleEl.value = u ? u.role : 'staff';
+    userEl.disabled = true;                                   // username (login id) can't be changed
+    pwEl.value = ''; pwEl.disabled = true; pwEl.placeholder = '—';
+    pwHint.textContent = '(เปลี่ยนรหัสผ่านทำผ่าน Supabase)';
+  } else {
+    document.getElementById('user-modal-title').textContent = 'เพิ่มผู้ใช้ใหม่';
+    nameEl.value = ''; userEl.value = ''; userEl.disabled = false;
+    pwEl.value = ''; pwEl.disabled = false; pwEl.placeholder = 'รหัสผ่าน (อย่างน้อย 6 ตัว)';
+    pwHint.textContent = '(ต้องกรอก)'; roleEl.value = 'staff';
+  }
   document.getElementById('user-modal').classList.add('open');
 }
 function closeUserModal() { document.getElementById('user-modal').classList.remove('open'); }
 
-function saveUser() {
+async function saveUser() {
   const name = document.getElementById('u-name').value.trim();
   const username = document.getElementById('u-username').value.trim();
   const password = document.getElementById('u-password').value;
   const role = document.getElementById('u-role').value;
   const errEl = document.getElementById('u-error');
-  if (!name || !username) { errEl.textContent = 'กรุณากรอกชื่อและ username'; return; }
-  const users = loadUsers();
-  const s = getSession();
-  if (_editingUserId) {
-    const idx = users.findIndex(u => u.id === _editingUserId);
-    if (idx < 0) { errEl.textContent = 'ไม่พบ user'; return; }
-    // Prevent removing last admin
-    if (users[idx].role === 'admin' && role !== 'admin' && users.filter(u => u.role==='admin').length <= 1) {
-      errEl.textContent = 'ต้องมี Admin อย่างน้อย 1 คนในระบบ'; return;
+  if (!name) { errEl.textContent = 'กรุณากรอกชื่อ'; return; }
+  if (!sb) { errEl.textContent = 'เชื่อมต่อเซิร์ฟเวอร์ไม่ได้'; return; }
+  errEl.textContent = 'กำลังบันทึก...';
+  try {
+    if (_editingUserId) {
+      const { error } = await sb.from('profiles').update({ name, role }).eq('id', _editingUserId);
+      if (error) { errEl.textContent = 'บันทึกไม่สำเร็จ: ' + error.message; return; }
+    } else {
+      if (!username) { errEl.textContent = 'กรุณากรอก username'; return; }
+      if (!password || password.length < 6) { errEl.textContent = 'รหัสผ่านอย่างน้อย 6 ตัว'; return; }
+      const email = username.toLowerCase() + EMAIL_DOMAIN;
+      // Sign up on a throwaway client so the admin's own session is NOT replaced
+      const tmp = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false, autoRefreshToken: false } });
+      const { error } = await tmp.auth.signUp({ email, password, options: { data: { username: username.toLowerCase(), name, role } } });
+      if (error) { errEl.textContent = /registered|already/i.test(error.message) ? 'Username นี้มีอยู่แล้ว' : ('สร้างไม่สำเร็จ: ' + error.message); return; }
+      try { await tmp.auth.signOut(); } catch (e) {}
     }
-    const dup = users.find(u => u.username === username && u.id !== _editingUserId);
-    if (dup) { errEl.textContent = 'Username นี้ถูกใช้แล้ว'; return; }
-    users[idx].name = name; users[idx].username = username; users[idx].role = role;
-    if (password) users[idx].password = password;
-  } else {
-    if (!password) { errEl.textContent = 'กรุณากรอก password'; return; }
-    if (users.find(u => u.username === username)) { errEl.textContent = 'Username นี้ถูกใช้แล้ว'; return; }
-    users.push({ id: Date.now().toString(), name, username, password, role });
-  }
-  saveUsers(users);
-  closeUserModal();
-  renderUsers();
-  showToast(_editingUserId ? 'อัปเดต User แล้ว' : 'เพิ่ม User แล้ว', 'success');
+    closeUserModal();
+    await renderUsers();
+    showToast(_editingUserId ? 'อัปเดต User แล้ว' : 'เพิ่ม User แล้ว — staff เข้าระบบได้เลย', 'success');
+  } catch (e) { errEl.textContent = 'เกิดข้อผิดพลาด: ' + (e && e.message ? e.message : e); }
 }
 
-function deleteUser(userId) {
-  const users = loadUsers();
-  const u = users.find(x => x.id === userId);
+// Enable/disable a user (we can't hard-delete auth users from the browser)
+async function toggleUserActive(userId) {
   const s = getSession();
+  if (userId === s?.id) { showToast('จัดการบัญชีตัวเองไม่ได้', 'error'); return; }
+  let u = null;
+  try { const { data } = await sb.from('profiles').select('name,role,active').eq('id', userId).single(); u = data; } catch (e) {}
   if (!u) return;
-  if (u.id === s?.id) { showToast('ไม่สามารถลบบัญชีตัวเองได้', 'error'); return; }
-  if (u.role === 'admin' && users.filter(x => x.role==='admin').length <= 1) { showToast('ต้องมี Admin อย่างน้อย 1 คน', 'error'); return; }
-  showConfirm('ลบผู้ใช้', `ต้องการลบ "${u.name}" ใช่ไหม?`, () => {
-    const updated = loadUsers().filter(x => x.id !== userId);
-    saveUsers(updated);
-    renderUsers();
-    showToast('ลบ User แล้ว', 'success');
-  });
+  const disabling = u.active !== false;
+  if (disabling && u.role === 'admin') {
+    const { data: admins } = await sb.from('profiles').select('id').eq('role', 'admin').neq('active', false);
+    if ((admins || []).length <= 1) { showToast('ต้องมี Admin ที่ใช้งานได้อย่างน้อย 1 คน', 'error'); return; }
+  }
+  showConfirm(
+    disabling ? 'ปิดใช้งานผู้ใช้' : 'เปิดใช้งานผู้ใช้',
+    `ต้องการ${disabling ? 'ปิด' : 'เปิด'}การใช้งาน "${u.name}"?` + (disabling ? ' (เข้าระบบไม่ได้จนกว่าจะเปิดใหม่)' : ''),
+    async () => {
+      const { error } = await sb.from('profiles').update({ active: !disabling }).eq('id', userId);
+      if (error) { showToast('ไม่สำเร็จ: ' + error.message, 'error'); return; }
+      await renderUsers();
+      showToast(disabling ? 'ปิดใช้งานแล้ว' : 'เปิดใช้งานแล้ว', 'success');
+    }
+  );
 }
 
-function renderUsers() {
-  const users = loadUsers();
-  const s = getSession();
+async function renderUsers() {
   const tbody = document.getElementById('users-tbody');
   if (!tbody) return;
+  if (!sb) { tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:16px">ออฟไลน์</td></tr>'; return; }
+  tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:16px">กำลังโหลด...</td></tr>';
+  const { data: users, error } = await sb.from('profiles').select('id,username,name,role,active').order('created_at');
+  if (error) { tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--red);padding:16px">โหลดไม่สำเร็จ: ' + error.message + '</td></tr>'; return; }
+  const s = getSession();
   const permLabels = { admin:'ทุกอย่าง + จัดการ User', manager:'ดูทุกหน้า + แก้ไข', staff:'บันทึกรายวันเท่านั้น' };
-  tbody.innerHTML = users.map(u => `
-    <tr>
-      <td><strong>${u.name}</strong>${u.id===s?.id?' <span style="color:var(--green);font-size:11px">(คุณ)</span>':''}</td>
-      <td style="color:var(--text2)">${u.username}</td>
-      <td><span class="role-badge ${u.role}">${ROLE_LABELS[u.role]}</span></td>
-      <td style="font-size:12px;color:var(--text2)">${permLabels[u.role]||''}</td>
-      <td style="text-align:center">
+  tbody.innerHTML = (users || []).map(u => {
+    const inactive = u.active === false;
+    return `<tr style="${inactive ? 'opacity:0.55' : ''}">
+      <td><strong>${u.name || '-'}</strong>${u.id === s?.id ? ' <span style="color:var(--green);font-size:11px">(คุณ)</span>' : ''}${inactive ? ' <span style="color:var(--red);font-size:11px">• ปิดอยู่</span>' : ''}</td>
+      <td style="color:var(--text2)">${u.username || '-'}</td>
+      <td><span class="role-badge ${u.role}">${ROLE_LABELS[u.role] || u.role}</span></td>
+      <td style="font-size:12px;color:var(--text2)">${permLabels[u.role] || ''}</td>
+      <td style="text-align:center;white-space:nowrap">
         <button class="btn btn-ghost btn-sm" style="margin-right:4px" onclick="openUserModal('${u.id}')">แก้ไข</button>
-        <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="deleteUser('${u.id}')">🗑</button>
+        ${u.id === s?.id ? '' : `<button class="btn btn-ghost btn-sm" style="color:${inactive ? 'var(--green)' : 'var(--red)'}" onclick="toggleUserActive('${u.id}')">${inactive ? 'เปิด' : 'ปิด'}</button>`}
       </td>
-    </tr>
-  `).join('');
+    </tr>`;
+  }).join('');
 }
 
 // ══════════════════════════════════════════════
