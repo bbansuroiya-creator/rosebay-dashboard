@@ -1382,7 +1382,7 @@
       <div class="sidebar-user-info">
         <div class="sidebar-user-name" id="sb-name">—</div>
         <div class="sidebar-user-role" id="sb-role">—</div>
-        <div id="sync-status" style="font-size:10px;color:var(--text3);margin-top:2px">● ซิงค์แล้ว</div>
+        <div id="sync-status" style="font-size:10px;color:var(--green);margin-top:2px" title="สถานะการซิงค์">●</div>
       </div>
       <button class="sidebar-logout" onclick="doLogout()" title="ออกจากระบบ">⎋</button>
     </div>
@@ -3150,9 +3150,9 @@ const _pushTimers = {};
 function _setSyncStatus(state) {
   const el = document.getElementById('sync-status');
   if (!el) return;
-  const map = { saving: ['●','var(--text3)','กำลังบันทึก…'], saved: ['●','var(--green)','ซิงค์แล้ว'], error: ['●','var(--red)','ซิงค์ไม่สำเร็จ'] };
-  const m = map[state] || map.saved;
-  el.textContent = m[0] + ' ' + m[2]; el.style.color = m[1];
+  const color = { saving: 'var(--text3)', saved: 'var(--green)', error: 'var(--red)' }[state] || 'var(--green)';
+  const tip = { saving: 'กำลังบันทึก…', saved: 'ซิงค์แล้ว', error: 'ซิงค์ไม่สำเร็จ' }[state] || 'ซิงค์แล้ว';
+  el.textContent = '●'; el.style.color = color; el.title = tip;
 }
 
 function cloudPush(cloudKey) {
